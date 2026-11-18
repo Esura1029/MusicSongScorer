@@ -124,14 +124,16 @@ class ClickDebugger:
             return
 
         screenshot = self.adb.take_screenshot("ocr_input.png")
-        results = self.ocr_engine.find_text(screenshot, None)
+        results = self.ocr_engine.find_all_text(screenshot)
 
         self.info_text.insert(tk.END, "\n=== OCR 识别结果 ===\n")
         self.ocr_results = []
         if results:
-            for text, pos in results:
-                self.info_text.insert(tk.END, f"文字: '{text}' -> 坐标: {pos}\n")
-                self.ocr_results.append((text, pos))
+            for text, conf, cx, cy in results:
+                self.info_text.insert(
+                    tk.END, f"文字: '{text}' ({conf:.2f}) -> 坐标: ({cx}, {cy})\n"
+                )
+                self.ocr_results.append((text, (cx, cy)))
         else:
             self.info_text.insert(tk.END, "未识别到文字\n")
         self.info_text.see(tk.END)

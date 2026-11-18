@@ -4,6 +4,7 @@ from typing import Dict, Optional, Any, Callable, Tuple
 
 from .ocr_engine import OCREngine
 from .adb_tools import ADBTools
+from .screen import Screen, ScreenSource
 
 
 class SongScorer:
@@ -38,6 +39,10 @@ class SongScorer:
     - 星级范围: 1-5星
     - 可配置范围: min_star 到 max_star（如2-4星）
     - 每个维度随机选择配置范围内的星级
+
+    【性能要点】
+    所有文字定位都复用 `Screen` 的 OCR 结果，
+    一个评分周期只需要 2~3 次 OCR，而不是此前的二十多次。
     """
 
     # 评分维度列表：旋律（曲调）、演唱（歌声）、歌词（词内容）
@@ -89,7 +94,12 @@ class SongScorer:
     }
 
     def __init__(
-        self, ocr: OCREngine, adb: ADBTools, min_star: int = 2, max_star: int = 5
+        self,
+        ocr: OCREngine,
+        adb: ADBTools,
+        min_star: int = 2,
+        max_star: int = 5,
+        screens: Optional[ScreenSource] = None,
     ):
         """初始化评分器
 
@@ -98,63 +108,49 @@ class SongScorer:
             adb: ADB工具实例，用于执行点击操作
             min_star: 最低评分星级（默认2星）
             max_star: 最高评分星级（默认5星）
+            screens: 共享的屏幕帧来源；不传则内部新建
         """
         self.ocr = ocr
         self.adb = adb
         self.min_star = min_star
         self.max_star = max_star
+        self.screens = screens or ScreenSource(ocr, adb)
 
-    def _validate_dimension_position(
-        self, screenshot: str, dim_name: str, dim_pos: Tuple[int, int]
+    def _validate_dimension_layout(
+        self, positions: Dict[str, Tuple[int, int]]
     ) -> bool:
-        """验证识别到的维度位置是否符合真实的维度间距规律
+        """验证识别到的维度坐标是否符合真实的维度间距规律
 
         【验证逻辑】
         真正的评分维度页面上，"旋律"、"演唱"、"歌词"三个维度
-        在Y轴上的间距固定约80像素。
-        如果识别到的"歌词"不在这个间距范围内，则可能是误识别。
+        在Y轴上的间距固定约80像素。识别到两个以上维度时，
+        至少需要有一对相邻维度的间距符合该规律。
+        只识别到一个维度时无法校验间距，交给调用方处理。
 
         Args:
-            screenshot: 截图文件路径
-            dim_name: 维度名称
-            dim_pos: 该维度的坐标 (x, y)
+            positions: 维度名称到坐标的映射
 
         Returns:
-            True 如果位置合理，否则 False
+            True 如果布局可信，否则 False
         """
-        all_positions = {}
-        for dim in self.DIMENSIONS:
-            pos = self.ocr.find_text(screenshot, dim)
-            if pos:
-                all_positions[dim] = pos
+        if not positions:
+            return False
 
-        if len(all_positions) < 2:
+        if len(positions) < 2:
             return True
 
-        y_ref = dim_pos[1]
-        for other_name, other_pos in all_positions.items():
-            if other_name == dim_name:
-                continue
-            y_diff = abs(other_pos[1] - y_ref)
-            expected_diff = self.DIMENSION_Y_SPACING
-            if abs(y_diff - expected_diff) <= self.DIMENSION_Y_TOLERANCE:
+        y_values = sorted(pos[1] for pos in positions.values())
+        for i in range(len(y_values) - 1):
+            gap = y_values[i + 1] - y_values[i]
+            if abs(gap - self.DIMENSION_Y_SPACING) <= self.DIMENSION_Y_TOLERANCE:
                 return True
-
-        if len(all_positions) >= 2:
-            y_values = [p[1] for p in all_positions.values()]
-            y_values.sort()
-            if len(y_values) >= 2:
-                gaps = [y_values[i + 1] - y_values[i] for i in range(len(y_values) - 1)]
-                for gap in gaps:
-                    if (
-                        abs(gap - self.DIMENSION_Y_SPACING)
-                        <= self.DIMENSION_Y_TOLERANCE
-                    ):
-                        return True
-
         return False
 
-    def rate_overall(self, rating_pos: Optional[tuple] = None) -> int:
+    def rate_overall(
+        self,
+        rating_pos: Optional[tuple] = None,
+        screen: Optional[Screen] = None,
+    ) -> int:
         """执行阶段1：总评分（弹窗中的星级选择）
 
         【工作原理】
@@ -169,6 +165,7 @@ class SongScorer:
 
         Args:
             rating_pos: "请评定"文字的坐标 (x, y)，如果为None则自动查找
+            screen: 当前屏幕帧，用于自动查找文字位置
 
         Returns:
             选择的星级数（2-5）
@@ -176,15 +173,16 @@ class SongScorer:
         star = random.randint(self.min_star, self.max_star)
         offset = self.STAR_POSITIONS_POPUP.get(star, 70)
 
+        if rating_pos is None:
+            if screen is None:
+                screen = self.screens.grab()
+            if screen is not None:
+                rating_pos = screen.find("请评定")
+
         if rating_pos:
-            # 直接使用传入的位置
             self.adb.tap(rating_pos[0] + offset, rating_pos[1] + 100)
         else:
-            # 自动查找"请评定"文字
-            screenshot = self.adb.take_screenshot("popup.png")
-            pos = self.ocr.find_text(screenshot, "请评定")
-            if pos:
-                self.adb.tap(pos[0] + offset, pos[1] + 100)
+            print("[WARNING] 未找到'请评定'文字，跳过总评分")
 
         return star
 
@@ -193,28 +191,15 @@ class SongScorer:
 
         【工作原理】
         1. 向上滑动屏幕，展开维度评分区域
-        2. 对每个维度文字进行定位
+        2. 截取一帧并对三个维度做一次统一 OCR
         3. 根据随机生成的星级，计算并点击对应位置
         4. 每个维度独立评分
-
-        【界面布局变化】
-        维度评分区域初始可能不在屏幕可见范围内，
-        需要向上滑动才能看到"旋律"、"演唱"、"歌词"三个维度。
-        滑动后这些维度的文字会出现在屏幕上方区域。
 
         【坐标计算详解】
         对于每个维度（如"旋律"）：
         1. OCR识别返回文字中心坐标 (dim_x, dim_y)
         2. 星级选项在该文字右侧水平排列
         3. 点击位置 = (dim_x + 星位偏移量, dim_y)
-
-        例如选择3星：
-        - 维度文字位置：假设OCR返回 (100, 300)
-        - 3星偏移量：600
-        - 点击位置：(100 + 600, 300) = (700, 300)
-
-        Args:
-            无参数（使用类属性中的维度列表）
 
         Returns:
             包含各维度评分的字典：
@@ -225,7 +210,7 @@ class SongScorer:
             }
             未识别到的维度值为 None
         """
-        results = {}
+        results: Dict[str, Optional[int]] = {dim: None for dim in self.DIMENSIONS}
 
         # 【关键步骤】滑动到维度评分区域
         # 维度区域初始不在可见范围，需要从当前位置向上滑动
@@ -235,60 +220,66 @@ class SongScorer:
         self.adb.swipe(360, 1000, 360, 250, 500)
         time.sleep(1)
 
-        # 截取滑动后的屏幕
-        screenshot = self.adb.take_screenshot("dimensions.png")
+        # 截取滑动后的屏幕：整帧只做一次 OCR
+        screen = self.screens.grab(force=True)
+        if screen is None:
+            print("[WARNING] 截图失败，跳过维度评分")
+            return results
+
+        # 一次性定位所有维度
+        positions = {}
+        for dim in self.DIMENSIONS:
+            pos = screen.find(dim)
+            if pos:
+                positions[dim] = pos
+
+        # 【布局验证】避免把歌词正文里的"歌词"误认为评分维度
+        if not self._validate_dimension_layout(positions):
+            print("[WARNING] 维度布局验证失败，可能是误识别")
+            return results
 
         # 遍历每个维度进行评分
-        for dim in self.DIMENSIONS:
-            dim_pos = self.ocr.find_text(screenshot, dim)
-            if dim_pos:
-                # 【Y轴间距验证】避免误识别
-                # 只有符合维度间距规律的位置才认为是真正的维度
-                if not self._validate_dimension_position(screenshot, dim, dim_pos):
-                    print(f"[WARNING] '{dim}' 位置验证失败，可能是误识别")
-                    results[dim] = None
-                    continue
+        for dim, dim_pos in positions.items():
+            # 【加权随机星级选择】
+            # 维度评分固定为2-5星，5星权重最低，2/3/4星权重相近
+            stars = list(self.DIMENSION_STAR_WEIGHTS.keys())
+            weights = list(self.DIMENSION_STAR_WEIGHTS.values())
+            dim_star = random.choices(stars, weights=weights, k=1)[0]
 
-                # 【加权随机星级选择】
-                # 维度评分固定为2-5星，5星权重最低，2/3/4星权重相近
-                stars = list(self.DIMENSION_STAR_WEIGHTS.keys())
-                weights = list(self.DIMENSION_STAR_WEIGHTS.values())
-                dim_star = random.choices(stars, weights=weights, k=1)[0]
+            # 【计算点击位置】
+            # 最终点击坐标 = 维度文字X + 星级偏移量
+            star_offset = self.STAR_POSITIONS_DIMENSION.get(dim_star, 315)
+            tap_x = dim_pos[0] + star_offset
 
-                # 【计算点击位置】
-                # 根据星级获取对应的X轴偏移量
-                star_offset = self.STAR_POSITIONS_DIMENSION.get(dim_star, 315)
-
-                # 最终点击坐标 = 维度文字X + 星级偏移量
-                tap_x = dim_pos[0] + star_offset
-
-                # 点击该位置
-                self.adb.tap(tap_x, dim_pos[1] + 3)
-                results[dim] = dim_star
-                time.sleep(0.5)  # 等待评分动画
-            else:
-                # 该维度文字未能识别（可能界面有变化）
-                results[dim] = None
+            # 点击该位置
+            self.adb.tap(tap_x, dim_pos[1] + 3)
+            results[dim] = dim_star
+            time.sleep(0.5)  # 等待评分动画
 
         return results
 
-    def submit_rating(self) -> bool:
+    def submit_rating(self, screen: Optional[Screen] = None) -> bool:
         """提交评分
 
         【工作原理】
-        1. 截取当前屏幕
+        1. 获取当前屏幕帧（未传入则重新截取）
         2. 查找"提交并评下一首"按钮
         3. 点击按钮完成提交
 
         Args:
-            无参数
+            screen: 已有的屏幕帧；星级点击之后界面会变化，
+                    默认重新截取以获取按钮的真实可用状态
 
         Returns:
             是否提交成功
         """
-        screenshot = self.adb.take_screenshot("submit.png")
-        submit_pos = self.ocr.find_text(screenshot, "提交并评下一首")
+        if screen is None:
+            screen = self.screens.grab(force=True)
 
+        if screen is None:
+            return False
+
+        submit_pos = screen.find("提交并评下一首")
         if submit_pos:
             self.adb.tap(submit_pos[0], submit_pos[1])
             return True
@@ -299,6 +290,7 @@ class SongScorer:
         self,
         page_info: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable] = None,
+        screen: Optional[Screen] = None,
     ) -> Dict[str, Any]:
         """执行完整的评分周期
 
@@ -323,6 +315,7 @@ class SongScorer:
         Args:
             page_info: 页面识别器返回的页面信息字典
             progress_callback: 进度回调函数，用于更新UI
+            screen: 当前屏幕帧，复用页面识别时的 OCR 结果
 
         Returns:
             包含完整评分结果的字典：
@@ -338,12 +331,14 @@ class SongScorer:
         """
         results = {"overall_star": None, "dimensions": {}, "submitted": False}
 
+        page_info = page_info or {}
+        if screen is None:
+            screen = page_info.get("screen")
+
         # 获取"请评定"文字位置
-        if page_info is None:
-            screenshot = self.adb.take_screenshot("rating_popup.png")
-            rating_pos = self.ocr.find_text(screenshot, "请评定")
-        else:
-            rating_pos = page_info.get("info", {}).get("rating_trigger_pos")
+        rating_pos = page_info.get("info", {}).get("rating_trigger_pos")
+        if rating_pos is None and screen is not None:
+            rating_pos = screen.find("请评定")
 
         # 【阶段1】执行总评分
         if rating_pos:
@@ -362,13 +357,15 @@ class SongScorer:
         if progress_callback:
             progress_callback(0, 0, "提交评分中...")
 
-        # 【阶段3】提交评分
+        # 【阶段3】提交评分：星级点击后按钮状态会变化，需要重新截取
         results["submitted"] = self.submit_rating()
 
         return results
 
     def rate_if_on_rating_page(
-        self, page_info: Dict[str, Any], progress_callback: Optional[Callable] = None
+        self,
+        page_info: Dict[str, Any],
+        progress_callback: Optional[Callable] = None,
     ) -> Dict[str, Any]:
         """条件评分：根据页面类型决定是否执行评分
 

@@ -13,6 +13,7 @@ CloudMusicCopilot/
 │   ├── ocr_engine.py         # PaddleOCR 文字识别引擎
 │   ├── page_recognizer.py    # 页面识别器（状态检测）
 │   ├── score_entrance.py     # 评分入口管理器
+│   ├── screen.py             # 屏幕帧模型（截图 + OCR 结果缓存）
 │   └── song_scorer.py        # 歌曲评分执行器
 ├── utils/                     # 工具模块
 │   ├── __init__.py
@@ -90,19 +91,53 @@ CloudMusicCopilot/
 - `connect()` - 连接设备
 - `tap(x, y)` - 点击指定坐标
 - `swipe(x1, y1, x2, y2, duration)` - 滑动操作
-- `take_screenshot(filename)` - 截取屏幕
+- `take_screenshot(filename)` - 截取屏幕（文件方式，供调试工具使用）
+- `capture_png()` - 直接返回 PNG 字节流（默认走 `exec-out`，失败自动回退）
 
-### 5. OCR 引擎 (`core/ocr_engine.py`)
+### 5. OCR 引擎 (`core/ocr_engine.py`) 与屏幕帧 (`core/screen.py`)
 
 基于 PaddleOCR 的文字识别引擎，提供：
-- `find_text(img_path, target)` - 查找文字位置
-- `find_all_text(img_path)` - 查找所有文字
+- `detect(image)` - 对一帧画面执行一次 OCR，返回全部识别结果
+- `find_text(img_path, target)` - 单次查询（每次调用都会执行 OCR）
+- `find_all_text(img_path)` - 单次查询全部文字
+
+`ScreenSource` / `Screen` 是所有上层的共享屏幕缓存：
+
+- 一帧画面只执行 **一次** OCR，`search/find/find_all` 全部在内存结果上完成
+- 截图使用 `adb exec-out screencap -p` 直接获取 PNG 字节，省掉 `pull` 和重复编解码
+- OCR 输入沿用"文件路径"方式（写入一个复用的 `screenshots/frame.png`），
+  避免 PaddlePaddle 3.x + oneDNN 对数组输入/扩展参数的兼容性问题
+- 画面未变化（PNG 字节 MD5 相同）时复用上一帧结果，跳过 OCR
+- 页面识别、入口查找、评分定位共用同一个 `Screen`，不再重复推理
+
+> 优化前，识别一次评分页面会触发 10 次以上整图 OCR（一个完整评分周期约 26 次）；
+> 优化后每帧 1 次、一个评分周期约 3 次，CPU 占用大幅下降。
 
 ## 安装依赖
 
 ```bash
-pip install paddlepaddle paddleocr customtkinter pillow
+pip install paddlepaddle==2.6.2 paddleocr==2.7.3 numpy==1.26.4 pandas==2.3.3 customtkinter pillow
 ```
+
+> **NumPy / OpenCV 版本注意**
+> PaddleOCR 2.7.3 依赖 `opencv-python/opencv-contrib-python <= 4.6.0.66`，
+> 这些 OpenCV 轮子是按 NumPy 1.x 的 ABI 编译的。若环境里是 NumPy 2.x，
+> `import cv2` 会报 `numpy.core.multiarray failed to import`，导入阶段就会失败。
+> 需要固定 `numpy==1.26.4`。
+>
+> 同一环境里只保留**一对同版本**的 OpenCV（`opencv-python==4.6.0.66` +
+> `opencv-contrib-python==4.6.0.66`）。不要再安装 `opencv-python-headless`
+> 或其它版本的 OpenCV：它们共用同一个 `cv2/` 目录，混装后卸载任意一个都会
+> 把其余的安装一起破坏（表现为 `cv2` 能导入但缺少 `INTER_NEAREST` 等属性）。
+> 若已混装，先全部卸载、删除残留的 `site-packages/cv2` 目录，再重新安装。
+
+> **PaddlePaddle 版本注意**
+> 本项目实机验证的稳定组合是 `paddlepaddle==2.6.2` + `paddleocr==2.7.3`。
+> 不建议升级到 PaddleOCR 3.x + PaddlePaddle 3.3.x：后者的 oneDNN 执行器存在
+> `ConvertPirAttribute2RuntimeAttribute not support` 缺陷，CPU 上 OCR 会直接崩溃。
+>
+> 程序同时兼容 PaddleOCR 2.x / 3.x 的接口与结果格式；万一运行在 3.3.x 上，
+> 会自动关闭 MKL-DNN 后重试（功能可用，但 CPU 识别会明显变慢）。
 
 ## 配置说明
 
