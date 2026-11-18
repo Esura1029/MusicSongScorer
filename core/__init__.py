@@ -2,6 +2,7 @@ from .adb_tools import ADBTools
 from .ocr_engine import OCREngine
 from .page_recognizer import PageRecognizer, PageType
 from .score_entrance import ScoreEntrance
+from .screen import Screen, ScreenSource, TextLine
 from .song_scorer import SongScorer
 
 __all__ = [
@@ -10,5 +11,8 @@ __all__ = [
     "PageRecognizer",
     "PageType",
     "ScoreEntrance",
+    "Screen",
+    "ScreenSource",
     "SongScorer",
+    "TextLine",
 ]

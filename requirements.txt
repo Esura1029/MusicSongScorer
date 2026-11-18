@@ -1,4 +1,13 @@
-paddlepaddle
-paddleocr
+# 经过实机验证的稳定组合
+paddlepaddle==2.6.2
+paddleocr==2.7.3
+# PaddleOCR 2.7.3 依赖 opencv<=4.6.0.66，该版本按 NumPy 1.x 的 ABI 编译，
+# 运行在 NumPy 2.x 下会报 "numpy.core.multiarray failed to import"
+numpy==1.26.4
+# 只保留这一对同版本 OpenCV。不要再装 opencv-python-headless 等其它发行包：
+# 它们共用同一个 cv2/ 目录，混装/卸载任意一个都会破坏其余的安装
+opencv-python==4.6.0.66
+opencv-contrib-python==4.6.0.66
+pandas==2.3.3
 customtkinter
 pillow

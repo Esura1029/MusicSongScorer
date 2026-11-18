@@ -3,6 +3,7 @@ from typing import Dict, Optional, Any, Tuple
 
 from .ocr_engine import OCREngine
 from .adb_tools import ADBTools
+from .screen import Screen, ScreenSource
 
 
 class ScoreEntrance:
@@ -30,17 +31,24 @@ class ScoreEntrance:
     # 评分入口按钮的可能文字（按优先级排列）
     ENTRY_TARGETS = ["评定今日歌曲", "继续评定", "每日听歌"]
 
-    def __init__(self, ocr: OCREngine, adb: ADBTools):
+    def __init__(
+        self,
+        ocr: OCREngine,
+        adb: ADBTools,
+        screens: Optional[ScreenSource] = None,
+    ):
         """初始化评分入口管理器
 
         Args:
             ocr: OCR引擎实例，用于识别界面文字
             adb: ADB工具实例，用于执行点击和滑动操作
+            screens: 共享的屏幕帧来源；不传则内部新建
         """
         self.ocr = ocr
         self.adb = adb
+        self.screens = screens or ScreenSource(ocr, adb)
 
-    def find_entry_button(self, screenshot: str) -> Dict[str, Any]:
+    def find_entry_button(self, screen: Screen) -> Dict[str, Any]:
         """在截图中查找评分入口按钮的位置
 
         【查找逻辑】
@@ -48,7 +56,7 @@ class ScoreEntrance:
         一旦找到就立即返回，不再继续查找。
 
         Args:
-            screenshot: 截图文件的路径
+            screen: 屏幕帧（已包含 OCR 结果）
 
         Returns:
             包含以下键的字典：
@@ -56,10 +64,9 @@ class ScoreEntrance:
             - pos: tuple (x, y)，按钮中心坐标（仅在found=True时）
             - type: str，按钮文字类型（仅在found=True时）
         """
-        for target in self.ENTRY_TARGETS:
-            pos = self.ocr.find_text(screenshot, target)
-            if pos:
-                return {"found": True, "pos": pos, "type": target}
+        line = screen.find_any(self.ENTRY_TARGETS)
+        if line:
+            return {"found": True, "pos": line.center, "type": line.text}
         return {"found": False}
 
     def enter_rating(self, entry_pos: Tuple[int, int], entry_type: str) -> bool:
@@ -100,7 +107,7 @@ class ScoreEntrance:
             time.sleep(0.3)
 
     def find_and_click_entry(
-        self, screenshot: Optional[str] = None, max_swipe: int = 3
+        self, screen: Optional[Screen] = None, max_swipe: int = 3
     ) -> Dict[str, Any]:
         """查找并点击评分入口（带滑动搜索）
 
@@ -111,13 +118,8 @@ class ScoreEntrance:
         4. 如果未找到，向上滑动后重复步骤2
         5. 最多滑动 max_swipe 次后仍找不到则返回失败
 
-        【典型场景】
-        - 入口在屏幕可见范围内：立即找到并点击
-        - 入口在屏幕下方：滑动1-2次后可见
-        - 入口被遮挡或不存在：滑动max_swipe次后放弃
-
         Args:
-            screenshot: 初始截图路径，如果为None则自动截取
+            screen: 初始屏幕帧，如果为None则自动截取
             max_swipe: 最大滑动次数
 
         Returns:
@@ -127,21 +129,26 @@ class ScoreEntrance:
             - attempts: int，尝试的次数
             - reason: str，失败时的原因（仅在success=False时）
         """
-        if screenshot is None:
-            screenshot = self.adb.take_screenshot("entry_scan.png")
+        if screen is None:
+            screen = self.screens.grab()
 
         # 尝试在当前屏幕和滑动后的屏幕中查找入口
         for attempt in range(max_swipe + 1):
-            result = self.find_entry_button(screenshot)
-            if result["found"]:
-                self.enter_rating(result["pos"], result["type"])
-                return {"success": True, "type": result["type"], "attempts": attempt}
+            if screen is not None:
+                result = self.find_entry_button(screen)
+                if result["found"]:
+                    self.enter_rating(result["pos"], result["type"])
+                    return {
+                        "success": True,
+                        "type": result["type"],
+                        "attempts": attempt,
+                    }
 
             # 未找到入口，向上滑动继续搜索
             if attempt < max_swipe:
                 self.swipe_up(2)  # 每次滑动两下，覆盖更大范围
                 time.sleep(1)
-                screenshot = self.adb.take_screenshot("entry_scan.png")
+                screen = self.screens.grab(force=True)
 
         return {"success": False, "reason": "未找到评分入口"}
 
@@ -172,9 +179,8 @@ class ScoreEntrance:
         elapsed = 0
 
         while elapsed < timeout:
-            screenshot = self.adb.take_screenshot("wait_popup.png")
-
-            if self.ocr.find_text(screenshot, "请评定"):
+            screen = self.screens.grab()
+            if screen is not None and screen.contains("请评定"):
                 return {"found": True, "stage": "popup"}
 
             time.sleep(check_interval)
